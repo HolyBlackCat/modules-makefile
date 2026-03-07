@@ -345,9 +345,9 @@ clang++ a.cppm -std=c++20 -fmodules-reduced-bmi -c -o a.o -fmodule-output=a.pcm
 
 `-fmodule-output=...` controls where the BMI is placed. The default is to use the same location as `-o` with a modified extension.
 
-Any time you import a module unit (no matter if in `.cpp` or in `.cppm`), you must add `-fmodule-path=NAME=PATH` for that module unit, and for everything it imports **recursively**.
+Any time you import a module unit (no matter if in `.cpp` or in `.cppm`), you must add `-fmodule-file=NAME=PATH` for that module unit, and for everything it imports **recursively**.
 
-There is also `-fprebuilt-module-path=...` to search BMIs in a directory, but then they need to be named in a particular way (matching the module name), and unlike other compilers, Clang never selects the BMI names automatically, so we'd have to ensure the right names ourselves. For this reason, I would prefer `-fmodule-path=...` (and because this is the only thing MSVC supports, so you need this logic anyway in your build system).
+There is also `-fprebuilt-module-path=...` to search BMIs in a directory, but then they need to be named in a particular way (matching the module name), and unlike other compilers, Clang never selects the BMI names automatically, so we'd have to ensure the right names ourselves. For this reason, I would prefer `-fmodule-file=...` (and because this is the only thing MSVC supports, so you need this logic anyway in your build system).
 
 ### GCC
 
@@ -413,7 +413,7 @@ Other flags|`-c`<br/>`-fmodules-reduced-bmi` to use a nicer BMI format (default 
 A module map?|No|[`-fmodule-mapper=...`](#gcc-1)<br/>Needed to support custom BMI paths.|`/ifcMap...`<br/>Optional, can be used instead of passing `/reference` for every imported module.|I recommend using it at least in GCC to customize the BMI paths.<br/>Optionally in MSVC to avoid dealing with `/reference`, but the same logic is needed for Clang anyway.<br/>Clang has [*some* kind of module maps](https://clang.llvm.org/docs/Modules.html#module-maps), but those seem to be for the non-standard Clang modules, not for C++20 modules.
 Choosing output object filename|`-o ...`|`-o ...`|`/Fo...` (without a space)
 Choosing output BMI filename|`-fmodule-output=...`<br/>(Not setting this uses the object filename with a modified extension.)|Taken from the module map.<br/>Or chosen automatically as `./gcm.cache/...` if no module map.|`/ifcOutput...`<br/>Or created in the current directory using the module name.|The filenames automatically selected by MSVC work with its implicit search for BMIs in the current directory.<br/>But the filenames automatically chosen by Clang don't work with its `-fprebuilt-module-path=...`, as they are based on the object filenames, not on the module names.
-Need to list imported BMI paths? |Yes, `-fmodule-path=NAME=PATH`.<br/>Can also search in directories using `-fprebuilt-module-path=...`, but that requires choosing the right BMI filenames in the build system, Clang doesn't automate this.|No. The module map is used if provided, otherwise the default path `./gcm.cache` is searched for BMIs.|`/reference NAME=PATH`<br/>Or using the module map.<br/>Additionally always searches for BMIs in `.` regardless of anything else.|When listing BMIs using flags, must list indirect dependencies too.
+Need to list imported BMI paths? |Yes, `-fmodule-file=NAME=PATH`.<br/>Can also search in directories using `-fprebuilt-module-path=...`, but that requires choosing the right BMI filenames in the build system, Clang doesn't automate this.|No. The module map is used if provided, otherwise the default path `./gcm.cache` is searched for BMIs.|`/reference NAME=PATH`<br/>Or using the module map.<br/>Additionally always searches for BMIs in `.` regardless of anything else.|When listing BMIs using flags, must list indirect dependencies too.
 Flags for different kinds of module units|`-xc++-module` for importable units (optional for `.cppm`)<br/>`-xc++` otherwise (optional for `.cpp`)|No|`/interface` for interface units<br/>`/internalPartition` for implementation partitions
 
 ## Clang's two-stage compilation
@@ -463,4 +463,14 @@ Reduced BMIs seem to be required if you want to avoid rebuilding importers of a 
 
 It's unclear which of those strategies is the best, and if they are better than the single-stage approach. Benchmarks are needed.
 
-Something tells me `1` is not a good strategy, and good strategy would involve reduced BMIs (so either `2`, `3`, or single-stage).
+Something tells me `1` is not a good strategy, as it forces importers to consume the full BMIs instead of reduced BMIs.
+
+I did a simple benchmark on this module:
+```cpp
+module;
+#include <iostream>
+export module A;
+export void foo() {}
+```
+
+And it seems that `1-1` and `2-1` are individually slower than the entire single-stage build, around 280ms vs 210ms, so strategies `1` and `2` seem to be pointless from the first glance. After Clang 23 gets released, we can benchmark `3`.

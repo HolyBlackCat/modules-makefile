@@ -1,4 +1,3 @@
-import B;
-import C;
+import A;
 
 int main() {}
