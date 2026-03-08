@@ -1,3 +1,6 @@
+# Force separate output of parallel jobs.
+MAKEFLAGS += -Otarget
+
 # Used to create local variables in a safer way. E.g. `$(call var,x := 42)`.
 override var = $(eval override $(subst #,$$(strip #),$(subst $,$$$$,$1)))
 
@@ -177,6 +180,53 @@ else
 $(error Unknown CXX_ID: `$(CXX_ID)`)
 endif
 
+# Module compilation strategy.
+MODULE_STRATEGY := 1
+MODULE_SINGLEPHASE_FLAGS :=
+MODULE_TWOPHASE_FLAGS_1 =
+MODULE_TWOPHASE_FLAGS_2 =
+MODULE_TWOPHASE_PARALLEL := 0
+$(if $(MODULE_STRATEGY),,$(error Empty MODULE_STRATEGY))
+ifeq ($(CXX_ID),clang)
+ifeq ($(MODULE_STRATEGY),1)# Single-stage.
+MODULE_SINGLEPHASE_FLAGS := -fmodules-reduced-bmi
+else ifeq ($(MODULE_STRATEGY),1_fullbmi)# Single-stage, using full BMIs, which is suboptimal.
+MODULE_SINGLEPHASE_FLAGS := -fno-modules-reduced-bmi
+else ifeq ($(MODULE_STRATEGY),2seq_fullbmi)# Two-stage with full BMIs (slow, and uses said full BMIs which is uncool).
+# In both flags, $1 is the BMI path.
+# In the second phase, we always add `OBJ_FLAGS`.
+MODULE_TWOPHASE_FLAGS_1 = --precompile -o $1
+MODULE_TWOPHASE_FLAGS_2 = -xpcm $1
+else ifeq ($(MODULE_STRATEGY),2seq)# Two-stage with reduced BMIs.
+MODULE_TWOPHASE_FLAGS_1 = --precompile -fmodules-reduced-bmi -fmodule-output=$1 -o $1.full
+MODULE_TWOPHASE_FLAGS_2 = -xpcm $1.full
+else ifeq ($(MODULE_STRATEGY),2par) # Two-stage in parallel with reduced BMIs. This needs Clang 23 or newer.
+# Enabling this indicates that phase 2 depends on the source directly, rather than on the output of phase 1.
+# It also changes the argument of `..._2` from the BMI path to the source file path.
+MODULE_TWOPHASE_PARALLEL := 1
+MODULE_TWOPHASE_FLAGS_1 = --precompile-reduced-bmi -o $1
+MODULE_TWOPHASE_FLAGS_2 = -xc++ $1
+else ifeq ($(MODULE_STRATEGY),2par_emulated) # Two-stage in parallel, emulated for Clang older than 23 (slow).
+MODULE_TWOPHASE_PARALLEL := 1
+MODULE_TWOPHASE_FLAGS_1 = --precompile -fmodules-reduced-bmi -fmodule-output=$1 -o /dev/null
+MODULE_TWOPHASE_FLAGS_2 = -xc++ $1
+else
+$(error Unknown Clang module strategy: `$(MODULE_STRATEGY)`)
+endif
+else ifeq ($(CXX_ID),gcc)
+$(if $(filter 1,$(MODULE_STRATEGY)),,$(error GCC doesn't support alternative module compilation strategies))
+else ifeq ($(CXX_ID),msvc)
+$(if $(filter 1,$(MODULE_STRATEGY)),,$(error MSVC doesn't support alternative module compilation strategies))
+else
+$(error Unknown CXX_ID: `$(CXX_ID)`)
+endif
+
+override MODULE_TWOPHASE_PARALLEL := $(filter-out 0,$(MODULE_TWOPHASE_PARALLEL))
+
+# Is two-phase modules compilation enabled?
+override modules_two_phases := $(if $(value MODULE_TWOPHASE_FLAGS_1),y)
+
+
 override source_to_mdep = $(foreach f,$1,$(OBJ_DIR)/$f.mdep)
 override source_to_dep = $(foreach f,$1,$(OBJ_DIR)/$f.d)
 # This returns empty if this is not an importable module.
@@ -215,7 +265,7 @@ $(foreach f,$(SOURCES),\
 	$(call, ### Introduce the dependencies of BMIs and object files on imported BMIs. It's easier to do both at the same time, without considering the module compilation strategy.)\
 	$(eval $(__obj) $(__bmi): $(call source_to_bmi,$(call module_to_source,$(__m_imports_$f))))\
 	$(call, ### The flags to specify the module map or the imported BMIs directly.)\
-	$(call var,__module_map_or_imports := \
+	$(call var,__flag_module_map_or_imports := \
 		$(if $(ENABLE_MODULE_MAP),\
 			$(MODULE_MAP_FLAG)$(MODULE_MAP)\
 		,\
@@ -225,18 +275,45 @@ $(foreach f,$(SOURCES),\
 			)\
 		)\
 	)\
-	$(call, ### Single-stage rules.)\
-	$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(common_compilation_dep) ; $(strip \
-		$(CXX) \
-		$(FULL_CXXFLAGS) \
-		$(OBJ_FLAGS)$(__obj) \
+	$(call, ### The flag for the current kind of translation unit.)\
+	$(call var,__flag_module_kind := \
 		$(if $(__module),\
-			$(if $(BMI_OUTPUT_FLAG),$(BMI_OUTPUT_FLAG)$(__bmi))\
-			$(if $(__m_is_interface_$(__module)),$(MODULE_EXPORT_INTERFACE_FLAG),$(MODULE_EXPORT_INTERAL_PARTITION_FLAG)) \
-		) \
-		$f \
-		$(__module_map_or_imports) \
-	))\
+			$(if $(__m_is_interface_$(__module)),$(MODULE_EXPORT_INTERFACE_FLAG),$(MODULE_EXPORT_INTERAL_PARTITION_FLAG))\
+		,\
+			$(MODULE_EXPORT_NOTHING_FLAG)\
+		)\
+	)\
+	$(call, ### Choose a compilation strategy)\
+	$(if $(and $(__module),$(modules_two_phases)),\
+		$(call, ### Multi-stage variants...)\
+		$(eval $(__bmi): $f | $(dir $(__bmi)) $(common_compilation_dep) ; $(strip \
+			$(CXX)\
+			$(FULL_CXXFLAGS)\
+			$(call MODULE_TWOPHASE_FLAGS_1,$(__bmi))\
+			$(__flag_module_kind)\
+			$f\
+			$(__flag_module_map_or_imports)\
+		))\
+		$(eval $(__obj): $(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)) | $(dir $(__obj)) ; $(strip \
+			$(CXX)\
+			$(FULL_CXXFLAGS)\
+			$(call MODULE_TWOPHASE_FLAGS_2,$(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)))\
+			$(OBJ_FLAGS)$(__obj)\
+			$(__flag_module_map_or_imports)\
+		))\
+	,\
+		$(call, ### Single-stage compilation.)\
+		$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(common_compilation_dep) ; $(strip \
+			$(CXX)\
+			$(FULL_CXXFLAGS)\
+			$(OBJ_FLAGS)$(__obj)\
+			$(MODULE_SINGLEPHASE_FLAGS)\
+			$(__flag_module_kind)\
+			$(if $(and $(__module),$(BMI_OUTPUT_FLAG)),$(BMI_OUTPUT_FLAG)$(__bmi))\
+			$f\
+			$(__flag_module_map_or_imports)\
+		))\
+	)\
 )
 
 # Link.

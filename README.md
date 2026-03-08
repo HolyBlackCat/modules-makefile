@@ -6,7 +6,11 @@ Each `.cpp` file is compiled independently. As a byproduct of the compilation, y
 
 Then on a rebuild, you check the modification times of the headers from that list, and if any of the headers were modified, you recompile the respective the `.cpp` file.
 
+To get the list of headers, you use `-MD -MP` on GCC and Clang (or `-MMD -MP` to skip system headers), and `/sourceDependencies output.json` on MSVC.
+
 ## What are C++20 modules
+
+TL;DR:
 
 Modules are an alternative to headers, but they need to be precompiled (into a compiler-specific format) before being imported, and importing those precompiled files is way faster than including headers.
 
@@ -14,11 +18,11 @@ Different compilers have different conventions for what to call those precompile
 
 Compiler|Name|Default extension
 ---|---|---
-Clang|BMI (built module interface)|`.gcm` (GNU compiled module?)
-GCC|CMI (compiled module interface)|`.pcm` (precompiled module)
+Clang|BMI (built module interface)|`.pcm` (precompiled module)
+GCC|CMI (compiled module interface)|`.gcm` (GNU compiled module?)
 MSVC|IFC (stands for "interface"?)|`.icf` (stands for "interface"?)
 
-Unlike headers, modules don't leak macros: importing a module doesn't give you its macros, and importing a module isn't affected by the macros you have defined.
+Unlike headers, modules don't leak macros: importing a module doesn't give you its macros, and the imported module isn't affected by the macros you have already defined.
 
 In addition to a BMI, compiling a module also produces an object file (`.o`), which should be linked into the final executable. (If the module doesn't contain function definitions and such, then forgetting to link the `.o` doesn't error.)
 
@@ -107,6 +111,8 @@ Another option for including headers seems to be to wrap them in `extern "C++" {
 ## Kinds of module units
 
 There are 4 kinds of module units, having different kinds of module declarations. They can share the same module name, and all module units sharing the name are called a single **"named module"** (or informally just a "module"). From outside of a named module, that named module is only importable in one piece.
+
+The kinds of module units are:
 
 1. `export module A;` is the **"primary module interface unit"**. This is the only required module unit in a named module, and there can only be one per named module.
 
@@ -201,7 +207,7 @@ There are 4 kinds of module units, having different kinds of module declarations
 
    The partition name `P` must be unique per named module across both interface and implementation partitions.
 
-To summarize summary:
+To summarize:
 
 &nbsp;|`export` (interface)|no `export` (implementation)
 ---|---|---
@@ -214,7 +220,9 @@ no `:Partition`|(1) primary interface unit|(2) implementation unit
 
 * `1`, `3`, `4` (but not `2`) are **importable units**, though only `1` can be imported outside of its named module.
 
-  Clang's convention is to use `.cppm` for importable units and `.cpp` for non-importable ones.
+Clang's convention is to use `.cppm` for importable units and `.cpp` for non-importable ones.
+
+The intent seems to be to have a relatively small amount of named modules in a project. The source files naturally tend to get separated into several subdirectories, and each such subdirectories is a good candidate for being a single named module.
 
 ## The build procedure for modules
 
@@ -317,17 +325,17 @@ Those are not strictly necessary for parsing those files. You can omit the corre
     ]
 }
 ```
-When partitions are involed, `:...` is just appended to the name string, so they don't need to be speecial-cased.
+When partitions are involed, `:...` is just appended to the name string, so they don't need to be special-cased.
 
 The implicit `import A;` in files starting with `export A;` is implicitly added to `requires`.
 
-Notice that `"requires": [...]` can't differentiate between `import`s and `export import`s, this doesn't matter for a build system.
+Notice that `"requires": [...]` can't differentiate between `import`s and `export import`s, but this doesn't really matter for a build system.
 
-## Single-stage compilation
+## Single-phase compilation
 
 All three compilers can do this, and this is the simplest approach.
 
-"Single stage" refers to the BMI and the `.o` being produced by the same compiler invocation.
+"Single phase" refers to the BMI and the `.o` being produced by the same compiler invocation. (Some sources count the scan as another phase, which adds to the confusion.)
 
 I'm told that GCC is able to report in real-time when the BMI is done (it can communicate so [over sockets or otherwise](https://gcc.gnu.org/onlinedocs/gcc/C_002b_002b-Module-Mapper.html)), but implementing this into a build system sounds like too much effort, so I'm going to ignore this in this tutorial.
 
@@ -416,11 +424,15 @@ Choosing output BMI filename|`-fmodule-output=...`<br/>(Not setting this uses th
 Need to list imported BMI paths? |Yes, `-fmodule-file=NAME=PATH`.<br/>Can also search in directories using `-fprebuilt-module-path=...`, but that requires choosing the right BMI filenames in the build system, Clang doesn't automate this.|No. The module map is used if provided, otherwise the default path `./gcm.cache` is searched for BMIs.|`/reference NAME=PATH`<br/>Or using the module map.<br/>Additionally always searches for BMIs in `.` regardless of anything else.|When listing BMIs using flags, must list indirect dependencies too.
 Flags for different kinds of module units|`-xc++-module` for importable units (optional for `.cppm`)<br/>`-xc++` otherwise (optional for `.cpp`)|No|`/interface` for interface units<br/>`/internalPartition` for implementation partitions
 
-## Clang's two-stage compilation
+## Clang's two-phase compilation
 
-As an alternative to the single-stage compilation described above (that produces both the BMI and the `.o` in a single compiler invocation), Clang has several two-stage compilation models to choose from, where the compiler is called twice per importable module unit: first to produce the BMI, and then to produce the object file.
+As an alternative to the single-phase compilation described above (that produces both the BMI and the `.o` in a single compiler invocation), Clang has several two-phase compilation models to choose from, where the compiler is called twice per importable module unit: first to produce the BMI, and then to produce the object file.
 
-Here they are:
+Note that some sources count the scan as an another phase, if you hear someone say that "all compilers use two-phase modules builds", they are referring to the scan as one of the stages, *not* to this strategy that Clang allows.
+
+The two-phase process only applies to exportable module units. Everything else must be built in one phase regardless.
+
+Here the Clang's two-phase models to choose from:
 
 ```
 1.
@@ -434,18 +446,18 @@ Here they are:
                  '-->  reduced BMI  -->  consumers
 
 3.
-       .-----1-->  a.o
+       .-----2-->  a.o
     a.cppm
-       '-----2-->  BMI  -->  consumers
+       '-----1-->  BMI  -->  consumers
 ```
 
 Clang has "full BMIs" vs "reduced BMIs". A full BMI is needed to be able to produce an `.o` from it, but otherwise a reduced BMI is better.
 
-Single-stage compilation (and `3` here) should use reduced BMIs, as those seem to be more optimal, but full BMIs should work for those too.
+Single-phase compilation (and `3` here) should use reduced BMIs, as those seem to be more optimal, but full BMIs should work for those too.
 
 Reduced BMIs seem to be required if you want to avoid rebuilding importers of a module when its source file changes, but the interface doesn't change (since full BMIs have to include function bodies and such, making the file hash different when a function body changes).
 
-`-fmodule-file=...` must be passed to **both** stages.
+`-fmodule-file=...` must be passed to **both** phases.
 
 * **`1-2` and `2-2`**: To produce an `.o` from a full BMI, just pass it instead of the source file, with `-c`. If the extension of the BMI is not `.pcm`, use `-xpcm` before the file.
 
@@ -453,15 +465,15 @@ Reduced BMIs seem to be required if you want to avoid rebuilding importers of a 
 
 * **`2-1`**: To produce both a full BMI and a reduced BMI, use `--precompile -fmodules-reduced-bmi -fmodule-output=a_reduced.pcm -o a_full.pcm`. Forgetting `-fmodules-reduced-bmi` on Clang 22 or newer does nothing, but on Clang 21 it silently doesn't emit the reduced BMI.
 
-* **`3-1`**: Just do `-xc++` to produce an `.o` without a BMI.
+* **`3-2`**: Just do `-xc++` to produce an `.o` without a BMI.
 
-* **`3-2`**: To produce a reduced BMI without also producing a full BMI or `.o`, use:
+* **`3-1`**: To produce a reduced BMI without also producing a full BMI or `.o`, use:
 
   * `--precompile-reduced-bmi` instead of `--precompile` — Needs Clang 23 or newer (which wasn't yet released at the time of writing this).
 
   * This could be imitated using `2-1`, sending the full BMI to `/dev/null`, but that seems slow enough to make approach 3 useless in Clang 22 and older.
 
-It's unclear which of those strategies is the best, and if they are better than the single-stage approach. Benchmarks are needed.
+It's unclear which of those strategies is the best, and if they are better than the single-phase approach. Benchmarks are needed.
 
 Something tells me `1` is not a good strategy, as it forces importers to consume the full BMIs instead of reduced BMIs.
 
@@ -473,4 +485,4 @@ export module A;
 export void foo() {}
 ```
 
-And it seems that `1-1` and `2-1` are individually slower than the entire single-stage build, around 280ms vs 210ms, so strategies `1` and `2` seem to be pointless from the first glance. After Clang 23 gets released, we can benchmark `3`.
+And it seems that `1-1` and `2-1` are individually **slower** than the entire single-phase build, around 280ms vs 210ms, so strategies `1` and `2` seem to be pointless at face value. After Clang 23 gets released, we can benchmark `3`.
