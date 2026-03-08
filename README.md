@@ -562,6 +562,34 @@ A few simple tests show that:
 
 Therefore at least for MSVC, we have to do `2`.
 
+## `import std;`
+
+C++23 includes modules for the standard library: `std` and `std.compat` (the latter additionally imports the C standard library contents into the global namespace, not only into `std::`).
+
+Since the BMIs depend on the compiler and its settings, the build system must build the BMIs for the standard modules. They don't come preinstalled with the compiler.
+
+The main issue is locating the sources for those modules. The procedure depends both on the compiler and on the chosen C++ standard library.
+
+* **GCC**: `g++ -print-file-name=libstdc++.modules.json`. This prints a path to a JSON, which in turn lists the paths to the two source files, `std.cc` and `std.compat.cc`, relative to the JSON itself.
+
+  In theory GCC can also work with libc++ instead of libstdc++, but this isn't a popular configuration. I hopy if this is enabled at GCC build time, `g++ -print-file-name=libc++.modules.json` should work, possibly with `-stdlib=libc++`.
+
+  Another option for GCC is not locating the file at all, and compiling it using `g++ -fsearch-include-path bits/std.cc ....` and similarly for `std.compat`. The flag `-fsearch-include-path` tells it to search the source files in include directories.
+
+* **Clang**: `clang++ -print-library-module-manifest-path`. Same style of JSON as GCC. This respects `-stdlib=libstdc++` vs `-stdlib=libc++`, and outputs the correct JSON for each.
+
+  This doesn't understand MSVC STL though. For MSVC STL it will print `<NOT PRESENT>`, refer to the MSVC procedure below.
+
+  Clang also understands the GCC-style `-print-file-name=libstdc++.modules.json`, and for libc++ `-print-file-name=libstdc++.modules.json`. But this seems worse than `-print-library-module-manifest-path`, since now you have to manually specify which standard library to use.
+
+* **MSVC**: Relative to the directory where `cl.exe` is located, use the file `../../../modules/modules.json`.
+
+  MSVC STL has a slightly different JSON format compared to GCC and Clang, but the idea is the same.
+
+Then compile those modules as usual.
+
+You can skip scanning those files, it seems that `std.compat` always imports `std`.
+
 ## Header units
 
 There is another kind of module units, called header units.
