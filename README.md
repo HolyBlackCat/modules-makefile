@@ -445,7 +445,7 @@ Single-stage compilation (and `3` here) should use reduced BMIs, as those seem t
 
 Reduced BMIs seem to be required if you want to avoid rebuilding importers of a module when its source file changes, but the interface doesn't change (since full BMIs have to include function bodies and such, making the file hash different when a function body changes).
 
-`-fmodule-file=...` must be passed to **both** stages, even in approach `2`.
+`-fmodule-file=...` must be passed to **both** stages.
 
 * **`1-2` and `2-2`**: To produce an `.o` from a full BMI, just pass it instead of the source file, with `-c`. If the extension of the BMI is not `.pcm`, use `-xpcm` before the file.
 

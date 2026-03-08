@@ -156,7 +156,7 @@ else
 $(error Unknown CXX_ID: `$(CXX_ID)`)
 endif
 
-# More flags.
+# Module flags.
 MODULE_IMPORT_FLAG :=
 MODULE_EXPORT_INTERFACE_FLAG :=
 MODULE_EXPORT_INTERAL_PARTITION_FLAG :=
@@ -198,6 +198,10 @@ all_objs := $(call source_to_obj,$(SOURCES))
 # Include the scan results that we're about to generate.
 include $(all_mdeps)
 
+# This is a common dependency for all compilation tasks.
+# This must be an order-only dependency: `| ...`.
+override common_compilation_dep := $(if $(ENABLE_MODULE_MAP),$(MODULE_MAP),$(all_mdeps))
+
 # Handle the source files.
 $(foreach f,$(SOURCES),\
 	$(call var,__mdep := $(call source_to_mdep,$f))\
@@ -210,16 +214,8 @@ $(foreach f,$(SOURCES),\
 	$(eval $(__mdep): $f | $(dir $(__mdep)) ; $(call SCAN_MODULES,$(__mdep),unused,$(call source_to_dep,$f),-,$f,$(FULL_CXXFLAGS)) | jq -r --arg src $f -f scripts/module_deps.jq >$(__mdep))\
 	$(call, ### Introduce the dependencies of BMIs and object files on imported BMIs. It's easier to do both at the same time, without considering the module compilation strategy.)\
 	$(eval $(__obj) $(__bmi): $(call source_to_bmi,$(call module_to_source,$(__m_imports_$f))))\
-	$(call, ### Single-stage rules.)\
-	$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(if $(ENABLE_MODULE_MAP),$(MODULE_MAP),$(all_mdeps)) ; $(strip \
-		$(CXX) \
-		$(FULL_CXXFLAGS) \
-		$(OBJ_FLAGS)$(__obj) \
-		$(if $(__module),\
-			$(if $(BMI_OUTPUT_FLAG),$(BMI_OUTPUT_FLAG)$(__bmi))\
-			$(if $(__m_is_interface_$(__module)),$(MODULE_EXPORT_INTERFACE_FLAG),$(MODULE_EXPORT_INTERAL_PARTITION_FLAG)) \
-		) \
-		$f \
+	$(call, ### The flags to specify the module map or the imported BMIs directly.)\
+	$(call var,__module_map_or_imports := \
 		$(if $(ENABLE_MODULE_MAP),\
 			$(MODULE_MAP_FLAG)$(MODULE_MAP)\
 		,\
@@ -228,6 +224,18 @@ $(foreach f,$(SOURCES),\
 				$(MODULE_IMPORT_FLAG)$(call module_to_mname,$d)=$(call source_to_bmi,$(call module_to_source,$d))\
 			)\
 		)\
+	)\
+	$(call, ### Single-stage rules.)\
+	$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(common_compilation_dep) ; $(strip \
+		$(CXX) \
+		$(FULL_CXXFLAGS) \
+		$(OBJ_FLAGS)$(__obj) \
+		$(if $(__module),\
+			$(if $(BMI_OUTPUT_FLAG),$(BMI_OUTPUT_FLAG)$(__bmi))\
+			$(if $(__m_is_interface_$(__module)),$(MODULE_EXPORT_INTERFACE_FLAG),$(MODULE_EXPORT_INTERAL_PARTITION_FLAG)) \
+		) \
+		$f \
+		$(__module_map_or_imports) \
 	))\
 )
 
