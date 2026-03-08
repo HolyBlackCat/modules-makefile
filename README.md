@@ -234,7 +234,7 @@ Then the file needs to be rebuilt if it had to be rescanned, or if any of the so
 
 This means that we no longer need to emit the header dependencies as the byproduct of the compilation (unlike pre-modules), since it can be done during scanning, and is needed to correctly rescan anyway (in theory, the alternative to emitting them during scans is to emit them during compilation, but then if the subsequent compilation of this TU fails, you would have to remember to rescan it; this seems unnecessarily complicated).
 
-But if rebuilding a BMI produced a bitwise identical file (a build system should compare hashes), then TUs importing it don't have to be rebuilt. This can happen e.g. if the imported module unit defines a function, and only its body has changed, assuming the compiler is sufficiently clever to not have the body affect the BMI.
+But if rebuilding a BMI produced a bitwise identical file (a build system should compare hashes), then TUs importing it don't have to be rebuilt. This can happen e.g. if the imported module unit defines a function, and only its body has changed, assuming the compiler is sufficiently clever to not have the body affect the BMI. [More details later.](f)
 
 ## Scanning dependencies
 
@@ -428,7 +428,7 @@ Flags for different kinds of module units|`-xc++-module` for importable units (o
 
 As an alternative to the single-phase compilation described above (that produces both the BMI and the `.o` in a single compiler invocation), Clang has several two-phase compilation models to choose from, where the compiler is called twice per importable module unit: first to produce the BMI, and then to produce the object file.
 
-Note that some sources count the scan as an another phase, if you hear someone say that "all compilers use two-phase modules builds", they are referring to the scan as one of the stages, *not* to this strategy that Clang allows.
+Note that some sources count the scan as an another phase, so if you hear someone say that "all compilers compile modules in two-phases", they're just counting the scan as one of the phases, they *don't* refer to this strategy that Clang allows.
 
 The two-phase process only applies to exportable module units. Everything else must be built in one phase regardless.
 
@@ -486,3 +486,62 @@ export void foo() {}
 ```
 
 And it seems that `1-1` and `2-1` are individually **slower** than the entire single-phase build, around 280ms vs 210ms, so strategies `1` and `2` seem to be pointless at face value. After Clang 23 gets released, we can benchmark `3`.
+
+## Comparing BMI hashes
+
+As mentioned earlier, rebuilding a BMI can produce a bitwise identical file if all changes are isolated to function bodies and such, or if the imported BMIs have changed but this BMI doesn't use any of the changed entities.
+
+For each BMI, after building it, hash it and store the hash to a file. Load the old hash first and compare them. (If this is [Clang's two-phase compilation](#clangs-two-phase-compilation) and you have both a full and a reduced BMI, hash the reduced BMI only.)
+
+Then, in theory, if your build system has a way to back out at runtime and mark a file as unmodified, you could just do that with the BMI. But Make doesn't.
+
+If your build system can't do this, you can emulate this by having a set of "unmodified BMIs" (their filenames; don't write the set to disk). If after building a BMI its hash didn't change, add the BMI to the set.
+
+Then, when building anything that `import`s a module (either another BMI, or just a non-importable `.o` file), if the only reason its being rebuild is due to imported BMI changes, and all those changed BMIs are in the unmodified set, then skip rebuilding this TU and just `touch` the resulting file. If this is a BMI, add it to the set too.
+
+When dealing with [Clang's two-phase compilation](#clangs-two-phase-compilation), this check is only needed for the first stage. The second stage should be skipped (`touch`ing the outputs instead) if and only if we skipped the first stage in the same way.
+
+I've tested this on the three compilers, and:
+
+* GCC doesn't seem to have reproducible BMI builds as of GCC 15, i.e. the hashes will be different even if the input files are the same.
+
+* Clang and MSVC do have reproducible BMI builds.
+
+### Handling indirect dependencies
+
+There is some uncertainty with indirect BMI dependencies.
+
+```cpp
+// a.cppm
+export module A;
+export import :P;
+```
+```cpp
+// ap.cppm
+export module A:P;
+export void foo() {}
+```
+```cpp
+// 1.cpp
+import A
+```
+Let's say `ap.cppm` gets modified in a way that changes its BMI (e.g. `foo` get removed from it).
+
+Then `ap.cppm` gets rebuilt, and so does `a.cppm` because a hash of its dependency has changed.
+
+We want `1.cpp` to be rebuilt too, which requires one of the two things to happen:
+
+1. Either the compiler must ensure that the hash of `a.cppm`'s BMI changes (when rebuilding it with a modified dependency).
+2. Or the build system has to check whether `ap.cppm`'s BMI has changed when considering whether to rebuild `1.cpp` (which normally wouldn't happen, since `ap.cppm` is not a direct dependency of it, only `a.cppm` is).
+
+A few simple tests show that:
+
+* Clang ensures that the hash of `a.cppm`'s BMI changes (but only when its comsumers can be affected, which is good).
+
+* MSVC **doesn't** ensure this.
+
+* GCC is moot, because it doesn't ensure reproducible BMI builds in the first place.
+
+Therefore at least for MSVC, the build system has to check modified-ness of indirectly imported dependencies too.
+
+For Clang we *can* skip the check, at least until we find a counterexample. Not checking lets us rebuild less things, so it's desirable if it doesn't affect correctness.

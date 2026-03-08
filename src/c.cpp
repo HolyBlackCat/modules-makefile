@@ -1,3 +1,5 @@
 import A;
 
-int main() {}
+#include <iostream>
+
+int main() {std::cout << foo() << '\n';}

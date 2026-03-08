@@ -1,16 +1,17 @@
 # Force separate output of parallel jobs.
 MAKEFLAGS += -Otarget
 
+
+# --- Helper functions.
+
 # Used to create local variables in a safer way. E.g. `$(call var,x := 42)`.
 override var = $(eval override $(subst #,$$(strip #),$(subst $,$$$$,$1)))
-
-# Encloses $1 in single quotes, with proper escaping for the shell.
-# If you makefile uses single quotes everywhere, a decent way to transition is to manually search and replace `'(\$(?:.|\(.*?\)))'` with `$(call quote,$1)`.
-override quote = '$(subst ','"'"',$1)'
 
 # A recursive wildcard function.
 # $1 is the list of directories, $2 is the list of wildcards.
 override rwildcard = $(foreach d,$(wildcard $(1:=/*)),$(call rwildcard,$d,$2) $(filter $(subst *,%,$2),$d))
+# Same as `$(shell ...)`, but triggers a error on failure.
+override safe_shell = $(shell $1)$(if $(filter-out 0,$(.SHELLSTATUS)),$(error Unable to execute `$1`, exit code $(.SHELLSTATUS)))
 
 # A line break.
 override define lf :=
@@ -18,6 +19,8 @@ $(call)
 $(call)
 endef
 
+
+# --- Basic compilation settings.
 
 SOURCE_DIRS := src
 SOURCES := $(call rwildcard,src,*.cpp *.cppm)
@@ -29,6 +32,8 @@ MODULE_MAP := $(OBJ_DIR)/module_map.txt
 
 OUTPUT_FILE := $(OUTPUT_DIR)/program$(EXT_EXE)
 
+
+# --- Target OS.
 
 # Detect the target OS.
 ifeq ($(OS),Windows_NT)
@@ -44,6 +49,8 @@ else
 EXT_EXE :=
 endif
 
+
+# --- Compiler and flags.
 
 # Pick a compiler.
 CXX ?= clang++
@@ -92,6 +99,10 @@ else
 OBJ_FLAGS := -c -o
 EXT_OBJ := .o
 endif
+
+# Using an entirely custom extension, just to check that it works.
+EXT_BMI := .bmi
+
 
 # The flags to link executables. The linker output filename immediately follows this.
 ifeq ($(CXX_ID),msvc)
@@ -188,25 +199,25 @@ MODULE_TWOPHASE_FLAGS_2 =
 MODULE_TWOPHASE_PARALLEL := 0
 $(if $(MODULE_STRATEGY),,$(error Empty MODULE_STRATEGY))
 ifeq ($(CXX_ID),clang)
-ifeq ($(MODULE_STRATEGY),1)# Single-stage.
+ifeq ($(MODULE_STRATEGY),1)# Single-phase.
 MODULE_SINGLEPHASE_FLAGS := -fmodules-reduced-bmi
-else ifeq ($(MODULE_STRATEGY),1_fullbmi)# Single-stage, using full BMIs, which is suboptimal.
+else ifeq ($(MODULE_STRATEGY),1_fullbmi)# Single-phase, using full BMIs, which is suboptimal.
 MODULE_SINGLEPHASE_FLAGS := -fno-modules-reduced-bmi
-else ifeq ($(MODULE_STRATEGY),2seq_fullbmi)# Two-stage with full BMIs (slow, and uses said full BMIs which is uncool).
+else ifeq ($(MODULE_STRATEGY),2seq_fullbmi)# Two-phase with full BMIs (slow, and uses said full BMIs which is uncool).
 # In both flags, $1 is the BMI path.
 # In the second phase, we always add `OBJ_FLAGS`.
 MODULE_TWOPHASE_FLAGS_1 = --precompile -o $1
 MODULE_TWOPHASE_FLAGS_2 = -xpcm $1
-else ifeq ($(MODULE_STRATEGY),2seq)# Two-stage with reduced BMIs.
+else ifeq ($(MODULE_STRATEGY),2seq)# Two-phase with reduced BMIs.
 MODULE_TWOPHASE_FLAGS_1 = --precompile -fmodules-reduced-bmi -fmodule-output=$1 -o $1.full
 MODULE_TWOPHASE_FLAGS_2 = -xpcm $1.full
-else ifeq ($(MODULE_STRATEGY),2par) # Two-stage in parallel with reduced BMIs. This needs Clang 23 or newer.
+else ifeq ($(MODULE_STRATEGY),2par) # Two-phase in parallel with reduced BMIs. This needs Clang 23 or newer.
 # Enabling this indicates that phase 2 depends on the source directly, rather than on the output of phase 1.
 # It also changes the argument of `..._2` from the BMI path to the source file path.
 MODULE_TWOPHASE_PARALLEL := 1
 MODULE_TWOPHASE_FLAGS_1 = --precompile-reduced-bmi -o $1
 MODULE_TWOPHASE_FLAGS_2 = -xc++ $1
-else ifeq ($(MODULE_STRATEGY),2par_emulated) # Two-stage in parallel, emulated for Clang older than 23 (slow).
+else ifeq ($(MODULE_STRATEGY),2par_emulated) # Two-phase in parallel, emulated for Clang older than 23 (slow).
 MODULE_TWOPHASE_PARALLEL := 1
 MODULE_TWOPHASE_FLAGS_1 = --precompile -fmodules-reduced-bmi -fmodule-output=$1 -o /dev/null
 MODULE_TWOPHASE_FLAGS_2 = -xc++ $1
@@ -227,12 +238,50 @@ override MODULE_TWOPHASE_PARALLEL := $(filter-out 0,$(MODULE_TWOPHASE_PARALLEL))
 override modules_two_phases := $(if $(value MODULE_TWOPHASE_FLAGS_1),y)
 
 
+# --- Hashing BMIs and skipping unchanged BMIs.
+
+SKIP_UNCHANGED_BMIS := 0
+override SKIP_UNCHANGED_BMIS := $(filter-out 0,$(SKIP_UNCHANGED_BMIS))
+
+# Is it possible that when a BMI is changed in a way that can affect the TUs that indirectly depend on it,
+#   the hashes of the direct dependencies of this TU don't change?
+# If true, we must check the hashes on the indirect dependencies ourselves.
+MUST_CHECK_INDIRECT_BMIS :=
+ifeq ($(MUST_CHECK_INDIRECT_BMIS),)
+ifeq ($(CXX_ID),clang)
+MUST_CHECK_INDIRECT_BMIS := 0# Likely no as of Clang 22.
+else ifeq ($(CXX_ID),gcc)
+MUST_CHECK_INDIRECT_BMIS := 1# Moot, because as of GCC 15 the BMI builds are not reproducible.
+else ifeq ($(CXX_ID),msvc)
+MUST_CHECK_INDIRECT_BMIS := 1# Confirmed yes.
+else
+$(error Unknown CXX_ID: `$(CXX_ID)`)
+endif
+endif
+override MUST_CHECK_INDIRECT_BMIS := $(filter-out 0,$(MUST_CHECK_INDIRECT_BMIS))
+
+# What program to use to hash BMIs.
+BMI_HASHER := md5sum
+# What extension to use for hash files.
+EXT_BMI_HASH := .md5
+
+ifeq ($(SKIP_UNCHANGED_BMIS),)
+# $1 is the list of filenames we're rebuilding, which must start with the BMI filename.
+# $2 is the command.
+override rebuild_if_needed = $2
+else
+override rebuild_if_needed = $$(if $$(foreach d,$$?,$$(if $$(filter %$(EXT_BMI)$(EXT_BMI_HASH),$$d),$$(if $$(__bmi_unmodified_$$d),,y),y)),$2,$$(call var,__bmi_unmodified_$(firstword $1)$(EXT_BMI_HASH) := y)touch $1 $(strip #) Skipping due to unchanged BMIs)
+endif
+
+
 override source_to_mdep = $(foreach f,$1,$(OBJ_DIR)/$f.mdep)
 override source_to_dep = $(foreach f,$1,$(OBJ_DIR)/$f.d)
 # This returns empty if this is not an importable module.
 override source_to_module = $(foreach f,$1,$(__m_provides_$f))
 # This returns empty if this is not an importable module.
-override source_to_bmi = $(foreach f,$1,$(if $(__m_provides_$f),$(OBJ_DIR)/$f.pcm))
+override source_to_bmi = $(foreach f,$1,$(if $(__m_provides_$f),$(OBJ_DIR)/$f$(EXT_BMI)))
+# Same as `source_to_bmi`, but if `SKIP_UNCHANGED_BMIS` is enabled, instead resolves to the file holding the BMI hash, instead of the BMI itself.
+override source_to_bmi_or_bmi_hash = $(foreach f,$1,$(if $(__m_provides_$f),$(OBJ_DIR)/$f$(EXT_BMI)$(if $(SKIP_UNCHANGED_BMIS),$(EXT_BMI_HASH))))
 override source_to_obj = $(foreach f,$1,$(OBJ_DIR)/$f$(EXT_OBJ))
 override module_to_source = $(foreach m,$1,$(__m_source_$m))
 # Internal module name to public module name.
@@ -252,6 +301,8 @@ include $(all_mdeps)
 # This must be an order-only dependency: `| ...`.
 override common_compilation_dep := $(if $(ENABLE_MODULE_MAP),$(MODULE_MAP),$(all_mdeps))
 
+
+
 # Handle the source files.
 $(foreach f,$(SOURCES),\
 	$(call var,__mdep := $(call source_to_mdep,$f))\
@@ -262,14 +313,16 @@ $(foreach f,$(SOURCES),\
 	$(call var,__bmi := $(call source_to_bmi,$f))\
 	$(call, ### Scan.)\
 	$(eval $(__mdep): $f | $(dir $(__mdep)) ; $(call SCAN_MODULES,$(__mdep),unused,$(call source_to_dep,$f),-,$f,$(FULL_CXXFLAGS)) | jq -r --arg src $f -f scripts/module_deps.jq >$(__mdep))\
+	$(call, ### Get recursive module dependencies.)\
+	$(call var,__imports_recursive := $(call source_to_imported_modules_recursive,$f))\
 	$(call, ### Introduce the dependencies of BMIs and object files on imported BMIs. It's easier to do both at the same time, without considering the module compilation strategy.)\
-	$(eval $(__obj) $(__bmi): $(call source_to_bmi,$(call module_to_source,$(__m_imports_$f))))\
+	$(eval $(__obj) $(__bmi): $(call source_to_bmi_or_bmi_hash,$(call module_to_source,$(if $(and $(SKIP_UNCHANGED_BMIS),$(MUST_CHECK_INDIRECT_BMIS)),$(__imports_recursive),$(__m_imports_$f)))))\
 	$(call, ### The flags to specify the module map or the imported BMIs directly.)\
 	$(call var,__flag_module_map_or_imports := \
 		$(if $(ENABLE_MODULE_MAP),\
 			$(MODULE_MAP_FLAG)$(MODULE_MAP)\
 		,\
-			$(foreach d,$(call source_to_imported_modules_recursive,$f),\
+			$(foreach d,$(__imports_recursive),\
 				$(if $(call module_to_source,$d),,$$(error Source file `$f` depends on an unknown module `$(call module_to_mname,$d)`))\
 				$(MODULE_IMPORT_FLAG)$(call module_to_mname,$d)=$(call source_to_bmi,$(call module_to_source,$d))\
 			)\
@@ -285,15 +338,15 @@ $(foreach f,$(SOURCES),\
 	)\
 	$(call, ### Choose a compilation strategy)\
 	$(if $(and $(__module),$(modules_two_phases)),\
-		$(call, ### Multi-stage variants...)\
-		$(eval $(__bmi): $f | $(dir $(__bmi)) $(common_compilation_dep) ; $(strip \
+		$(call, ### Two-phase.)\
+		$(eval $(__bmi): $f | $(dir $(__bmi)) $(common_compilation_dep) ; $(strip $(call rebuild_if_needed,$(__bmi),\
 			$(CXX)\
 			$(FULL_CXXFLAGS)\
 			$(call MODULE_TWOPHASE_FLAGS_1,$(__bmi))\
 			$(__flag_module_kind)\
 			$f\
 			$(__flag_module_map_or_imports)\
-		))\
+		)))\
 		$(eval $(__obj): $(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)) | $(dir $(__obj)) ; $(strip \
 			$(CXX)\
 			$(FULL_CXXFLAGS)\
@@ -302,8 +355,8 @@ $(foreach f,$(SOURCES),\
 			$(__flag_module_map_or_imports)\
 		))\
 	,\
-		$(call, ### Single-stage compilation.)\
-		$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(common_compilation_dep) ; $(strip \
+		$(call, ### Single-phase compilation.)\
+		$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(common_compilation_dep) ; $(strip $(call rebuild_if_needed,$(__bmi) $(__obj),\
 			$(CXX)\
 			$(FULL_CXXFLAGS)\
 			$(OBJ_FLAGS)$(__obj)\
@@ -312,9 +365,25 @@ $(foreach f,$(SOURCES),\
 			$(if $(and $(__module),$(BMI_OUTPUT_FLAG)),$(BMI_OUTPUT_FLAG)$(__bmi))\
 			$f\
 			$(__flag_module_map_or_imports)\
-		))\
+		)))\
+	)\
+	$(call, ### Hash BMIs to skip unchanged BMIs.)\
+	$(if $(and $(SKIP_UNCHANGED_BMIS),$(__module)),\
+		$(call var,__bmi_hash := $(__bmi)$(EXT_BMI_HASH))\
+		$(eval $(__bmi_hash): $(__bmi) ; \
+			$$(if $$(__bmi_unmodified_$(__bmi_hash)),\
+				touch $(__bmi_hash) # Skipping hashing\
+			,\
+				$$(call var,___bmi_old_hash := $$(file <$(__bmi_hash)))\
+				$$(call var,___bmi_new_hash := $$(call safe_shell,$(BMI_HASHER) $(__bmi)))\
+				$$(file >$(__bmi_hash),$$(___bmi_new_hash))\
+				$$(call var,__bmi_unmodified_$(__bmi_hash) := $$(if $$(findstring $$(___bmi_new_hash),$$(___bmi_old_hash)),y))\
+				true # Done hashing: $(__bmi) -- $$(if $$(__bmi_unmodified_$(__bmi_hash)),not changed,changed)\
+			)\
+		)\
 	)\
 )
+
 
 # Link.
 .DEFAULT_GOAL := $(OUTPUT_FILE)
