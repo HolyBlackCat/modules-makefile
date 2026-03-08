@@ -1,4 +1,12 @@
-# How C++20 modules are compiled
+# How to compile C++20 modules yourself
+
+## Intro
+
+I was curious about C++20 modules, but I don't just want to throw them into a black box (called CMake) which would handle them for me, I want to understand how the build process works.
+
+So I've looked into how modules need to be handled on different compilers, and documented it here.
+
+An example makefile is provided, that supports Clang, GCC, and MSVC, including all of the Clang's module compilation strategies, and that correctly rebuilds when modifying a module doesn't affect its interface.
 
 ## Pre-C++20 compilation model
 
@@ -7,6 +15,8 @@ Each `.cpp` file is compiled independently. As a byproduct of the compilation, y
 Then on a rebuild, you check the modification times of the headers from that list, and if any of the headers were modified, you recompile the respective the `.cpp` file.
 
 To get the list of headers, you use `-MD -MP` on GCC and Clang (or `-MMD -MP` to skip system headers), and `/sourceDependencies output.json` on MSVC.
+
+If you're planning to build modules with makefiles, make sure you can handle header dependencies correctly first.
 
 ## What are C++20 modules
 
@@ -70,6 +80,8 @@ Here are simple instructions how to compile this, a more detailed explanation is
   cl /nologo /EHsc 1.cpp /std:c++20 /c
   cl a.obj 1.obj
   ```
+
+* Clang-CL — doesn't support MSVC-style module flags, but you can pass `clang++`-style flags by prefixing them with `/clang:`. Or just don't use Clang-CL.
 
 In each of those, the first command both produces a BMI and an object file for the module. The second command consumes (imports) that BMI and produces an object file for the file consuming the module. Then the third command links the two object files together. (Notice that with Clang, we need to tell it where to find the BMI for a specific module. More on the differences between compilers later.)
 
@@ -234,15 +246,13 @@ Then the file needs to be rebuilt if it had to be rescanned, or if any of the so
 
 This means that we no longer need to emit the header dependencies as the byproduct of the compilation (unlike pre-modules), since it can be done during scanning, and is needed to correctly rescan anyway (in theory, the alternative to emitting them during scans is to emit them during compilation, but then if the subsequent compilation of this TU fails, you would have to remember to rescan it; this seems unnecessarily complicated).
 
-But if rebuilding a BMI produced a bitwise identical file (a build system should compare hashes), then TUs importing it don't have to be rebuilt. This can happen e.g. if the imported module unit defines a function, and only its body has changed, assuming the compiler is sufficiently clever to not have the body affect the BMI. [More details later.](f)
+But if rebuilding a BMI produced a bitwise identical file (a build system should compare hashes), then TUs importing it don't have to be rebuilt. This can happen e.g. if the imported module unit defines a function, and only its body has changed, assuming the compiler is sufficiently clever to not have the body affect the BMI. [More details later.](#comparing-bmi-hashes)
 
 ## Scanning dependencies
 
 The scan commands need the same flags as your compiler: include paths, macros, language standard, etc.
 
 The compilers have converged on the common JSON-based format for outputting module scan results, called [`P1689R5`](https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p1689r5.html) after the proposal that introduced it.
-
-The format itself seems to allow for scanning multiple source files by a single command (see the [`"rules": [...]` array](#p1689r5-schema-summary)), but none of the three compilers I tested can actually do this, from what I understand. The only compiler that attempts this is MSVC, but it outputs multiple braced groups in a row (`{...}{...}`) instead of filling the `"rules"` array, resulting in malformed JSON.
 
 ### Clang
 ```sh
@@ -298,6 +308,12 @@ MSVC doesn't understand the `.cppm` extension by default, using `/TP` to force i
 You can use the `a.mtgt` and `a.dtgt` to carry arbitrary information to the resulting module deps files and headers deps files respectively.
 
 Those are not strictly necessary for parsing those files. You can omit the corresponding parameters and get some default strings.
+
+### Scanning multiple files with a single command
+
+The format itself seems to allow for scanning multiple source files by a single command (see the [`"rules": [...]` array](#p1689r5-schema-summary)), and from my testing the only compiler that can do this is Clang **if** instead of providing the compiler flags manually to `clang-scan-deps`, you write them to a `compiler_commands.json` and pass that, [as described here](https://clang.llvm.org/docs/StandardCPlusPlusModules.html#discovering-dependencies).
+
+Either way, this doesn't seem terribly useful compared to scanning the files individually, in parallel.
 
 ## P1689R5 schema summary
 
@@ -531,17 +547,43 @@ Then `ap.cppm` gets rebuilt, and so does `a.cppm` because a hash of its dependen
 
 We want `1.cpp` to be rebuilt too, which requires one of the two things to happen:
 
-1. Either the compiler must ensure that the hash of `a.cppm`'s BMI changes (when rebuilding it with a modified dependency).
+1. Either the compiler must ensure that the hash of `a.cppm`'s BMI changes (when rebuilding it with a modified dependency if that can affect its consumers).
 2. Or the build system has to check whether `ap.cppm`'s BMI has changed when considering whether to rebuild `1.cpp` (which normally wouldn't happen, since `ap.cppm` is not a direct dependency of it, only `a.cppm` is).
+
+`1` is more desirable because this lets us skip more rebuilds. Only the compiler can tell what dependency changes affect or don't affect the consumers of this module unit, so any implementation of this in the build system (i.e. `2`) have to be conservative and sometimes rebuild more things than necessary.
 
 A few simple tests show that:
 
-* Clang ensures that the hash of `a.cppm`'s BMI changes (but only when its comsumers can be affected, which is good).
+* Clang seems to support `1`, or at least I can't find a counterexample.
 
-* MSVC **doesn't** ensure this.
+* MSVC **doesn't** support `1`.
 
 * GCC is moot, because it doesn't ensure reproducible BMI builds in the first place.
 
-Therefore at least for MSVC, the build system has to check modified-ness of indirectly imported dependencies too.
+Therefore at least for MSVC, we have to do `2`.
 
-For Clang we *can* skip the check, at least until we find a counterexample. Not checking lets us rebuild less things, so it's desirable if it doesn't affect correctness.
+## Header units
+
+There is another kind of module units, called header units.
+
+Headers (with no special module-related annotations) can be compiled into BMIs, and then imported using `import "foo.h"` or `import <foo.h>`. Macros can be imported from header units (but they don't propagate in the other direction, from the importer into the imported header).
+
+The three compilers seem to already support those, at least minimally.
+
+The big problem currently is that the module scans don't list imported header units: some compilers ignore them entirely, and some try to import their BMIs during the scans and then error if those BMIs can't be found.
+
+Currently this can be worked around by building **all** header units before touching any other `.cpp`/`.cppm` files, but:
+
+* This prevents us from doing anything else in parallel.
+
+* We can't support `import`s in header units, neither of named modules nor of other header units. (We could scan header units for imports, and then build any imported modules before header units, but this assumes that those modules themselves don't import any header units.)
+
+The proper solution for this seems to be for compilers to internally replace header unit `import`s with `#include`s during scans, but no compiler has implemented this yet.
+
+There's also a GCC-specific issue of being unable to specify header units in module maps, having to rely on the default BMI paths (`./gcm.cache`). Or if it's possible, I haven't figured out the right syntax yet.
+
+To me it seems that header units are not ready yet, and we should wait for the compiler vendors to cook them more.
+
+---
+
+That's all, thanks for reading!

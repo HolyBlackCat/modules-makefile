@@ -240,7 +240,9 @@ override modules_two_phases := $(if $(value MODULE_TWOPHASE_FLAGS_1),y)
 
 # --- Hashing BMIs and skipping unchanged BMIs.
 
-SKIP_UNCHANGED_BMIS := 0
+# Should we hash BMIs and try to optimize out unnecessary recompilations based on this.
+# As of GCC 15, this is pointless on GCC since BMIs are not reproducible.
+SKIP_UNCHANGED_BMIS := 1
 override SKIP_UNCHANGED_BMIS := $(filter-out 0,$(SKIP_UNCHANGED_BMIS))
 
 # Is it possible that when a BMI is changed in a way that can affect the TUs that indirectly depend on it,
@@ -266,11 +268,12 @@ BMI_HASHER := md5sum
 EXT_BMI_HASH := .md5
 
 ifeq ($(SKIP_UNCHANGED_BMIS),)
-# $1 is the list of filenames we're rebuilding, which must start with the BMI filename.
-# $2 is the command.
-override rebuild_if_needed = $2
+# $1 is the BMI filename if we're rebuilding a BMI, or empty otherwise.
+# $2 is the list of filenames we're rebuilding, which may or may not include the BMI.
+# $3 is the command.
+override rebuild_if_needed = $3
 else
-override rebuild_if_needed = $$(if $$(foreach d,$$?,$$(if $$(filter %$(EXT_BMI)$(EXT_BMI_HASH),$$d),$$(if $$(__bmi_unmodified_$$d),,y),y)),$2,$$(call var,__bmi_unmodified_$(firstword $1)$(EXT_BMI_HASH) := y)touch $1 $(strip #) Skipping due to unchanged BMIs)
+override rebuild_if_needed = $$(if $$(foreach d,$$?,$$(if $$(filter %$(EXT_BMI)$(EXT_BMI_HASH),$$d),$$(if $$(__bmi_unmodified_$$d),,y),y)),$3,$(if $1,$$(call var,__bmi_unmodified_$(firstword $1)$(EXT_BMI_HASH) := y))touch $2 $(strip #) Skipping due to unchanged BMIs)
 endif
 
 
@@ -315,8 +318,8 @@ $(foreach f,$(SOURCES),\
 	$(eval $(__mdep): $f | $(dir $(__mdep)) ; $(call SCAN_MODULES,$(__mdep),unused,$(call source_to_dep,$f),-,$f,$(FULL_CXXFLAGS)) | jq -r --arg src $f -f scripts/module_deps.jq >$(__mdep))\
 	$(call, ### Get recursive module dependencies.)\
 	$(call var,__imports_recursive := $(call source_to_imported_modules_recursive,$f))\
-	$(call, ### Introduce the dependencies of BMIs and object files on imported BMIs. It's easier to do both at the same time, without considering the module compilation strategy.)\
-	$(eval $(__obj) $(__bmi): $(call source_to_bmi_or_bmi_hash,$(call module_to_source,$(if $(and $(SKIP_UNCHANGED_BMIS),$(MUST_CHECK_INDIRECT_BMIS)),$(__imports_recursive),$(__m_imports_$f)))))\
+	$(call, ### Introduce the dependencies of BMIs and object files on imported BMIs. Here we're listing indirect dependencies only if this compiler requires checking them when skipping unchanged BMIs.)\
+	$(eval $(__bmi) $(__obj): $(call source_to_bmi_or_bmi_hash,$(call module_to_source,$(if $(and $(SKIP_UNCHANGED_BMIS),$(MUST_CHECK_INDIRECT_BMIS)),$(__imports_recursive),$(__m_imports_$f)))))\
 	$(call, ### The flags to specify the module map or the imported BMIs directly.)\
 	$(call var,__flag_module_map_or_imports := \
 		$(if $(ENABLE_MODULE_MAP),\
@@ -339,7 +342,8 @@ $(foreach f,$(SOURCES),\
 	$(call, ### Choose a compilation strategy)\
 	$(if $(and $(__module),$(modules_two_phases)),\
 		$(call, ### Two-phase.)\
-		$(eval $(__bmi): $f | $(dir $(__bmi)) $(common_compilation_dep) ; $(strip $(call rebuild_if_needed,$(__bmi),\
+		$(call, ### Phase 1 out of 2, which builds at least the importable BMI.)\
+		$(eval $(__bmi): $f | $(dir $(__bmi)) $(common_compilation_dep) ; $(strip $(call rebuild_if_needed,$(__bmi),$(__bmi),\
 			$(CXX)\
 			$(FULL_CXXFLAGS)\
 			$(call MODULE_TWOPHASE_FLAGS_1,$(__bmi))\
@@ -347,16 +351,18 @@ $(foreach f,$(SOURCES),\
 			$f\
 			$(__flag_module_map_or_imports)\
 		)))\
-		$(eval $(__obj): $(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)) | $(dir $(__obj)) ; $(strip \
+		$(call, ### Phase 2 out of 2, which builds the object file.)\
+		$(call, ### Using `rebuild_if_needed` here makes things easier for us, but makes this slightly more computationally intensive in two-phase sequental builds, where we could instead only check if the BMI in phase 1 had to be rebuilt or not.)\
+		$(eval $(__obj): $(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)) $(common_compilation_dep) | $(dir $(__obj)) ; $(strip $(call rebuild_if_needed,,$(__obj)\
 			$(CXX)\
 			$(FULL_CXXFLAGS)\
 			$(call MODULE_TWOPHASE_FLAGS_2,$(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)))\
 			$(OBJ_FLAGS)$(__obj)\
 			$(__flag_module_map_or_imports)\
-		))\
+		)))\
 	,\
 		$(call, ### Single-phase compilation.)\
-		$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(common_compilation_dep) ; $(strip $(call rebuild_if_needed,$(__bmi) $(__obj),\
+		$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(common_compilation_dep) ; $(strip $(call rebuild_if_needed,$(__bmi),$(__bmi) $(__obj),\
 			$(CXX)\
 			$(FULL_CXXFLAGS)\
 			$(OBJ_FLAGS)$(__obj)\
