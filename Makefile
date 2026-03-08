@@ -353,7 +353,7 @@ $(foreach f,$(SOURCES),\
 		)))\
 		$(call, ### Phase 2 out of 2, which builds the object file.)\
 		$(call, ### Using `rebuild_if_needed` here makes things easier for us, but makes this slightly more computationally intensive in two-phase sequental builds, where we could instead only check if the BMI in phase 1 had to be rebuilt or not.)\
-		$(eval $(__obj): $(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)) $(common_compilation_dep) | $(dir $(__obj)) ; $(strip $(call rebuild_if_needed,,$(__obj)\
+		$(eval $(__obj): $(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)) $(common_compilation_dep) | $(dir $(__obj)) ; $(strip $(call rebuild_if_needed,,$(__obj),\
 			$(CXX)\
 			$(FULL_CXXFLAGS)\
 			$(call MODULE_TWOPHASE_FLAGS_2,$(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)))\

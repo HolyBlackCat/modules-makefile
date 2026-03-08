@@ -81,7 +81,7 @@ Here are simple instructions how to compile this, a more detailed explanation is
   cl a.obj 1.obj
   ```
 
-* Clang-CL — doesn't support MSVC-style module flags, but you can pass `clang++`-style flags by prefixing them with `/clang:`. Or just don't use Clang-CL.
+* Clang-CL — doesn't seem to support MSVC-style module flags, but supports `clang++`-style module flags. Older Clang versions needed them prefixed with `/clang:`. See [this discussion in CMake bug tracker](https://gitlab.kitware.com/cmake/cmake/-/issues/25731).
 
 In each of those, the first command both produces a BMI and an object file for the module. The second command consumes (imports) that BMI and produces an object file for the file consuming the module. Then the third command links the two object files together. (Notice that with Clang, we need to tell it where to find the BMI for a specific module. More on the differences between compilers later.)
 
