@@ -1,3 +1,3 @@
 export module A;
 
-export import :P;
+export import :Part;

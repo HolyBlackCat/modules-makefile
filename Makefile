@@ -2,7 +2,7 @@
 MAKEFLAGS += -Otarget
 
 
-# --- Helper functions.
+# --- Helpers.
 
 # Used to create local variables in a safer way. E.g. `$(call var,x := 42)`.
 override var = $(eval override $(subst #,$$(strip #),$(subst $,$$$$,$1)))
@@ -12,6 +12,12 @@ override var = $(eval override $(subst #,$$(strip #),$(subst $,$$$$,$1)))
 override rwildcard = $(foreach d,$(wildcard $(1:=/*)),$(call rwildcard,$d,$2) $(filter $(subst *,%,$2),$d))
 # Same as `$(shell ...)`, but triggers a error on failure.
 override safe_shell = $(shell $1)$(if $(filter-out 0,$(.SHELLSTATUS)),$(error Unable to execute `$1`, exit code $(.SHELLSTATUS)))
+# Like `safe_shell`, but always returns an empty string, discarding stdout.
+override safe_shell_exec = $(call,$(call safe_shell,$1))
+
+# Encloses $1 in single quotes, with proper escaping for the shell.
+# If you makefile uses single quotes everywhere, a decent way to transition is to manually search and replace `'(\$(?:.|\(.*?\)))'` with `$(call quote,$1)`.
+override quote = '$(subst ','"'"',$1)'
 
 # A line break.
 override define lf :=
@@ -35,11 +41,18 @@ OUTPUT_FILE := $(OUTPUT_DIR)/program$(EXT_EXE)
 
 # --- Target OS.
 
-# Detect the target OS.
+# Guess the target OS.
 ifeq ($(OS),Windows_NT)
 TARGET_OS := windows
 else
-TARGET_OS := linux
+TARGET_OS := unix
+endif
+
+# Guess the host OS.
+ifneq ($(filter %-pc-msys %-w64-mingw32,$(MAKE_HOST)),)
+HOST_OS := windows
+else
+HOST_OS := unix
 endif
 
 # The executable extension.
@@ -47,6 +60,13 @@ ifeq ($(TARGET_OS),windows)
 EXT_EXE := .exe
 else
 EXT_EXE :=
+endif
+
+# The /dev/null equivalent.
+ifeq ($(HOST_OS),windows)
+DEV_NULL := NUL
+else
+DEV_NULL := /dev/null
 endif
 
 
@@ -89,6 +109,12 @@ FULL_CXXFLAGS := /nologo /EHsc $(CXXFLAGS)
 else
 $(error Unknown CXX_ID: `$(CXX_ID)`)
 endif
+endif
+
+# The flags to create standard modules, `std` and `std.compat`.
+STD_MODULE_FLAGS :=
+ifeq ($(CXX_ID),clang)
+STD_MODULE_FLAGS := -Wno-reserved-module-identifier
 endif
 
 # The flags to create object files. The object filename immediately follows this.
@@ -219,7 +245,7 @@ MODULE_TWOPHASE_FLAGS_1 = --precompile-reduced-bmi -o $1
 MODULE_TWOPHASE_FLAGS_2 = -xc++ $1
 else ifeq ($(MODULE_STRATEGY),2par_emulated) # Two-phase in parallel, emulated for Clang older than 23 (slow).
 MODULE_TWOPHASE_PARALLEL := 1
-MODULE_TWOPHASE_FLAGS_1 = --precompile -fmodules-reduced-bmi -fmodule-output=$1 -o /dev/null
+MODULE_TWOPHASE_FLAGS_1 = --precompile -fmodules-reduced-bmi -fmodule-output=$1 -o $(DEV_NULL)
 MODULE_TWOPHASE_FLAGS_2 = -xc++ $1
 else
 $(error Unknown Clang module strategy: `$(MODULE_STRATEGY)`)
@@ -238,12 +264,63 @@ override MODULE_TWOPHASE_PARALLEL := $(filter-out 0,$(MODULE_TWOPHASE_PARALLEL))
 override modules_two_phases := $(if $(value MODULE_TWOPHASE_FLAGS_1),y)
 
 
+# --- The `std` and`std.compat` modules.
+
+# Should we enable the std module?
+ENABLE_STD_MODULE := 1
+override ENABLE_STD_MODULE := $(filter-out 0,$(ENABLE_STD_MODULE))
+ifneq ($(ENABLE_STD_MODULE),)
+
+# Stores the path to the original manifest JSON from this standard library.
+STD_MODULE_MANIFEST_PATH_FILE := $(OBJ_DIR)/std_module_manifest_path.txt
+# An importable makefile piece with the information about the standard modules.
+STD_MODULE_PATHS_FILE := $(OBJ_DIR)/std_module_info.txt
+
+# Locate the module manifest, write the path to it to a file.
+# For Clang, need the flags to know which standard library to use.
+$(STD_MODULE_MANIFEST_PATH_FILE): | $(dir $(STD_MODULE_MANIFEST_PATH_FILE))
+ifeq ($(CXX_ID),clang)
+	$(call var,__tmp := $(shell mktemp))
+	$(file >$(__tmp),#include <yvals.h>)
+	$(warning $(CXX) $(CXXFLAGS) -xc++ $(__tmp) -H -fsyntax-only 2>$(__tmp).out)
+	$(shell $(CXX) $(FULL_CXXFLAGS) -xc++ $(__tmp) -H -fsyntax-only 2>$(__tmp).out)
+	$(if $(filter 0,$(.SHELLSTATUS)),\
+		$(file >$@,$(dir $(call safe_shell,awk '{gsub(/\\\\/,"/",$$2); print $$2; exit}' $(__tmp).out))../modules/modules.json)\
+	,\
+		$(call safe_shell_exec,$(CXX) $(FULL_CXXFLAGS) -print-library-module-manifest-path >$@)\
+	)
+	$(call safe_shell_exec,rm -f $(__tmp) $(__tmp).out)
+	true # Wrote the std module manifest path to: $@
+else ifeq ($(CXX_ID),gcc)
+	$(CXX) -print-file-name=libstdc++.modules.json >$@
+else ifeq ($(CXX_ID),msvc)
+	$(call var,__tmp := $(shell mktemp))
+	$(file >$(__tmp),#include <yvals.h>)
+	$(file >$@,$(dir $(subst \,/,$(call safe_shell,cl /TP $(__tmp) /nologo /sourceDependencies- /scanDependencies NUL | jq -r '.Data.Includes[0]')))../modules/modules.json)
+	$(call, ### Convert to a Linux path if needed.)
+	$(if $(filter unix,$(HOST_OS)),$(call safe_shell_exec,winepath $(call quote,$(file <$@)) >$@))
+	$(call safe_shell_exec,rm -f $(__tmp))
+	true # Wrote the std module manifest path to: $@
+else
+$(error Unknown CXX_ID: `$(CXX_ID)`)
+endif
+
+# Extract the std module paths from the manifest and write them to a piece of a makefile.
+$(STD_MODULE_PATHS_FILE): $(STD_MODULE_MANIFEST_PATH_FILE) | $(dir $(STD_MODULE_PATHS_FILE))
+	$(call var,__manifest := $(file <$(STD_MODULE_MANIFEST_PATH_FILE)))
+	jq --arg dir $(dir $(__manifest)) -r -f 'scripts/module_manifest.jq' $(__manifest) >$@
+
+include $(STD_MODULE_PATHS_FILE)
+endif
+
+
+
 # --- Hashing BMIs and skipping unchanged BMIs.
 
 # Should we hash BMIs and try to optimize out unnecessary recompilations based on this.
 # As of GCC 15, this is pointless on GCC since BMIs are not reproducible.
-SKIP_UNCHANGED_BMIS := 1
-override SKIP_UNCHANGED_BMIS := $(filter-out 0,$(SKIP_UNCHANGED_BMIS))
+NON_CASCADING_CHANGES := 1
+override NON_CASCADING_CHANGES := $(filter-out 0,$(NON_CASCADING_CHANGES))
 
 # Is it possible that when a BMI is changed in a way that can affect the TUs that indirectly depend on it,
 #   the hashes of the direct dependencies of this TU don't change?
@@ -267,7 +344,7 @@ BMI_HASHER := md5sum
 # What extension to use for hash files.
 EXT_BMI_HASH := .md5
 
-ifeq ($(SKIP_UNCHANGED_BMIS),)
+ifeq ($(NON_CASCADING_CHANGES),)
 # $1 is the BMI filename if we're rebuilding a BMI, or empty otherwise.
 # $2 is the list of filenames we're rebuilding, which may or may not include the BMI.
 # $3 is the command.
@@ -277,15 +354,20 @@ override rebuild_if_needed = $$(if $$(foreach d,$$?,$$(if $$(filter %$(EXT_BMI)$
 endif
 
 
-override source_to_mdep = $(foreach f,$1,$(OBJ_DIR)/$f.mdep)
-override source_to_dep = $(foreach f,$1,$(OBJ_DIR)/$f.d)
+# --- The compilation process.
+
+# Here $1 is the list of sources and $2 is the desired extension for the output files.
+override source_to_output_file = $(foreach f,$1,$(OBJ_DIR)$(if $(filter /%,$f),/$(notdir $f),/$f)$2)
+
+override source_to_obj = $(call source_to_output_file,$1,$(EXT_OBJ))
+override source_to_dep = $(call source_to_output_file,$1,.d)
+override source_to_mdep = $(call source_to_output_file,$1,.mdep)
 # This returns empty if this is not an importable module.
 override source_to_module = $(foreach f,$1,$(__m_provides_$f))
 # This returns empty if this is not an importable module.
-override source_to_bmi = $(foreach f,$1,$(if $(__m_provides_$f),$(OBJ_DIR)/$f$(EXT_BMI)))
-# Same as `source_to_bmi`, but if `SKIP_UNCHANGED_BMIS` is enabled, instead resolves to the file holding the BMI hash, instead of the BMI itself.
-override source_to_bmi_or_bmi_hash = $(foreach f,$1,$(if $(__m_provides_$f),$(OBJ_DIR)/$f$(EXT_BMI)$(if $(SKIP_UNCHANGED_BMIS),$(EXT_BMI_HASH))))
-override source_to_obj = $(foreach f,$1,$(OBJ_DIR)/$f$(EXT_OBJ))
+override source_to_bmi = $(foreach f,$1,$(if $(__m_provides_$f),$(call source_to_output_file,$f,$(EXT_BMI))))
+# Same as `source_to_bmi`, but if `NON_CASCADING_CHANGES` is enabled, instead resolves to the file holding the BMI hash, instead of the BMI itself.
+override source_to_bmi_or_bmi_hash = $(foreach f,$1,$(if $(__m_provides_$f),$(call source_to_output_file,$f,$(EXT_BMI)$(if $(NON_CASCADING_CHANGES),$(EXT_BMI_HASH)))))
 override module_to_source = $(foreach m,$1,$(__m_source_$m))
 # Internal module name to public module name.
 override module_to_mname = $(subst -,:,$1)
@@ -319,7 +401,9 @@ $(foreach f,$(SOURCES),\
 	$(call, ### Get recursive module dependencies.)\
 	$(call var,__imports_recursive := $(call source_to_imported_modules_recursive,$f))\
 	$(call, ### Introduce the dependencies of BMIs and object files on imported BMIs. Here we're listing indirect dependencies only if this compiler requires checking them when skipping unchanged BMIs.)\
-	$(eval $(__bmi) $(__obj): $(call source_to_bmi_or_bmi_hash,$(call module_to_source,$(if $(and $(SKIP_UNCHANGED_BMIS),$(MUST_CHECK_INDIRECT_BMIS)),$(__imports_recursive),$(__m_imports_$f)))))\
+	$(eval $(__bmi) $(__obj): $(call source_to_bmi_or_bmi_hash,$(call module_to_source,$(if $(and $(NON_CASCADING_CHANGES),$(MUST_CHECK_INDIRECT_BMIS)),$(__imports_recursive),$(__m_imports_$f)))))\
+	$(call, ### Flags for this specific source file. We use this e.g. to add a flag to std modules on Clang to disable the warning about their name.)\
+	$(call var,__file_flags := $(FULL_CXXFLAGS) $(if $(__m_is_stdlib_$f),$(STD_MODULE_FLAGS)))\
 	$(call, ### The flags to specify the module map or the imported BMIs directly.)\
 	$(call var,__flag_module_map_or_imports := \
 		$(if $(ENABLE_MODULE_MAP),\
@@ -345,7 +429,7 @@ $(foreach f,$(SOURCES),\
 		$(call, ### Phase 1 out of 2, which builds at least the importable BMI.)\
 		$(eval $(__bmi): $f | $(dir $(__bmi)) $(common_compilation_dep) ; $(strip $(call rebuild_if_needed,$(__bmi),$(__bmi),\
 			$(CXX)\
-			$(FULL_CXXFLAGS)\
+			$(__file_flags)\
 			$(call MODULE_TWOPHASE_FLAGS_1,$(__bmi))\
 			$(__flag_module_kind)\
 			$f\
@@ -355,7 +439,7 @@ $(foreach f,$(SOURCES),\
 		$(call, ### Using `rebuild_if_needed` here makes things easier for us, but makes this slightly more computationally intensive in two-phase sequental builds, where we could instead only check if the BMI in phase 1 had to be rebuilt or not.)\
 		$(eval $(__obj): $(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)) $(common_compilation_dep) | $(dir $(__obj)) ; $(strip $(call rebuild_if_needed,,$(__obj),\
 			$(CXX)\
-			$(FULL_CXXFLAGS)\
+			$(__file_flags)\
 			$(call MODULE_TWOPHASE_FLAGS_2,$(if $(MODULE_TWOPHASE_PARALLEL),$f,$(__bmi)))\
 			$(OBJ_FLAGS)$(__obj)\
 			$(__flag_module_map_or_imports)\
@@ -364,7 +448,7 @@ $(foreach f,$(SOURCES),\
 		$(call, ### Single-phase compilation.)\
 		$(eval $(__obj) $(__bmi) &: $f | $(dir $(__obj)) $(common_compilation_dep) ; $(strip $(call rebuild_if_needed,$(__bmi),$(__bmi) $(__obj),\
 			$(CXX)\
-			$(FULL_CXXFLAGS)\
+			$(__file_flags)\
 			$(OBJ_FLAGS)$(__obj)\
 			$(MODULE_SINGLEPHASE_FLAGS)\
 			$(__flag_module_kind)\
@@ -374,7 +458,7 @@ $(foreach f,$(SOURCES),\
 		)))\
 	)\
 	$(call, ### Hash BMIs to skip unchanged BMIs.)\
-	$(if $(and $(SKIP_UNCHANGED_BMIS),$(__module)),\
+	$(if $(and $(NON_CASCADING_CHANGES),$(__module)),\
 		$(call var,__bmi_hash := $(__bmi)$(EXT_BMI_HASH))\
 		$(eval $(__bmi_hash): $(__bmi) ; \
 			$$(if $$(__bmi_unmodified_$(__bmi_hash)),\
