@@ -604,11 +604,13 @@ The main issue is locating the sources for those modules. The procedure depends 
 
   Another option for GCC is not locating the file at all, and compiling it using `g++ -fsearch-include-path bits/std.cc ....` and similarly for `std.compat`. The flag `-fsearch-include-path` tells it to search for the specified source files in include directories.
 
-* **Clang**: `clang++ -print-library-module-manifest-path`. Same style of JSON as GCC. This respects `-stdlib=libstdc++` vs `-stdlib=libc++`, and outputs the correct JSON for each.
+* **Clang**: For libstdc++ and libc++: `clang++ -print-library-module-manifest-path`. Same style of JSON as GCC. This respects `-stdlib=libstdc++` vs `-stdlib=libc++`, and outputs the correct JSON for each.
 
   Clang also understands the GCC-style `-print-file-name=libstdc++.modules.json`, and for libc++ `-print-file-name=libstdc++.modules.json`. But this seems worse than `-print-library-module-manifest-path`, since now you have to manually specify which standard library to use.
 
-  This doesn't understand MSVC STL though. For MSVC STL it will print `<NOT PRESENT>`. I couldn't find a proper procedure for MSVC STL, but this hack seems to work:
+  Clang't doesn't understand GCC's `-fsearch-include-path`.
+
+  The flag `-print-library-module-manifest-path` doesn't work with MSVC STL. For MSVC STL it will print `<NOT PRESENT>`. I couldn't find a proper procedure for MSVC STL, but this hack seems to work:
 
   * Make a `.cpp` file containing only `#include <yvals.h>`. Compile it with `-H -fsyntax-only`.
 
@@ -616,7 +618,7 @@ The main issue is locating the sources for those modules. The procedure depends 
 
   * Relative to that path, you want `....\MSVC\14.50.35717\modules\modules.json`.
 
-  When it's unclear what standard library is being used, I'd try to the MSVC STL search first, and if that header is not found, fall back to `-print-library-module-manifest-path`.
+  When it's unclear what standard library is being used, I'd try the MSVC STL procedure first, and if that header is not found, fall back to `-print-library-module-manifest-path`.
 
 * **MSVC**: Again no standardized search procedure, but the following seems to work.
 
@@ -636,7 +638,11 @@ You could even skip scanning those files, as it seems that `std.compat` always i
 
 There is another kind of module units, called header units.
 
-Headers (with no special module-related annotations) can be compiled into BMIs, and then imported using `import "foo.h"` or `import <foo.h>`. Macros can be imported from header units (but they don't propagate in the other direction, from the importer into the imported header). Header units don't produce `.o` files.
+Headers (with no special module-related annotations) can be compiled into BMIs, and then imported using `import "foo.h"` or `import <foo.h>` (or even using the `#include` syntax via certain compiler flags).
+
+Macros can be imported from header units (but they don't propagate in the other direction, from the importer into the imported header).
+
+Header units seem to not produce `.o` files.
 
 The three compilers seem to already support those, at least minimally.
 
